@@ -17,7 +17,12 @@ from dpark import _ctx as dpark
 from dpark.dependency import Aggregator
 from math import log
 
-########## Combinators ########## 
+########## Utils ##############
+def str2date(s, format='%Y%m%d'):
+    return datetime.datetime.strptime(s, format).date()
+
+
+########## Combinators ##########
 def result(v):
     return lambda tokens: iter([(v, tokens)])
 
@@ -111,7 +116,7 @@ def chainl1(p, op):
                     result(x))
     return bind(p, rest)
 
-########## Lexer ########## 
+########## Lexer ##########
 def quote(s, c):
     return re.sub(r'([\\%s])' % c, r'\\\1', s)
 
@@ -203,7 +208,7 @@ lexer = re.Scanner([
     (r'\s+', None),
 ], re.I)
 
-########## Expressions ########## 
+########## Expressions ##########
 class Table(object):
     def get_columns(self):
         pass
@@ -245,37 +250,32 @@ class PartialTable(Table):
 
         expr = tables[self.table_name].expr
         if self.selectors:
-            r = expr.file_path
-            path = set()
-            for s in self.selectors:
-                for p in glob.glob('%s/%s' % (r, s)):
-                    if not os.path.isdir(p):
-                        path.add(p)
-                    else:
-                        for root, _, names in walk(p, followlinks=True):
-                            path.update(os.path.join(root, name) for name in names
-                                        if not name.startswith('.'))
+            files = []
+            if len(self.selectors) == 1:
+                selectors = self.selectors * 2
+            else:
+                selectors = self.selectors
+            begin, end = [str2date(x) for x in selectors]
 
-            path = list(path)
+            day = begin
+            w2 = '%02d'
+            while day <= end:
+                path = expr.file_path.format(Y=day.year, m=w2%day.month, d=w2%day.day)
+                files += glob.glob(path)
+                day += datetime.timedelta(1)
         else:
-            path = expr.file_path
+            files = glob.glob(expr.file_path)
 
-        if use_limit and isinstance(path, basestring):
-            for root, _, names in walk(path, followlinks=True):
-                if names:
-                    path = [os.path.join(root, name) for name in names]
-                    break
-        
-        rdd = dpark.textFile(path)
+        rdd = dpark.textFile(files)
         if expr.expr:
             rdd = eval('rdd.' + expr.expr, global_env, {'rdd':rdd})
 
         row = rdd.first()
         if isinstance(row, basestring):
             if '\t' in row:
-                rdd = rdd.fromCsv('excel-tab')
+                rdd = rdd.map(lambda x: x.split('\t'))
             elif ',' in row:
-                rdd = rdd.fromCsv('excel')
+                rdd = rdd.map(lambda x: x.split(','))
             else:
                 rdd = rdd.map(lambda l:l.split(' '))
 
@@ -295,7 +295,7 @@ class CartesianTable(Table):
         tables = self.tables
         if len(self.tables) == 1:
             return tables[0].gen_rdd(**kwargs)
-        
+
         rdd = tables[0].gen_rdd()
         for t in tables[1:]:
             rdd = rdd.cartesian(t.gen_rdd()).map(lambda x:list(chain.from_iterable(x)))
@@ -468,25 +468,25 @@ class Expr(object):
 
     def __ne__(self, other):
         return combine('<>', operator.ne, self, other)
-                                
+
     def __gt__(self, other):
         return combine('>', operator.gt, self, other)
-                                
+
     def __lt__(self, other):
         return combine('<', operator.lt, self, other)
-                                
+
     def __ge__(self, other):
         return combine('>=', operator.ge, self, other)
-                                
+
     def __le__(self, other):
         return combine('<=', operator.le, self, other)
-                                
+
     def and_(self, other):
         return combine('AND', operator.and_, self, other)
-                                
+
     def or_(self, other):
         return combine('OR', operator.or_, self, other)
-                                
+
     def not_(self):
         return combine('NOT', operator.not_, self)
 
@@ -636,15 +636,15 @@ class AvgExpr(SetExpr):
                 lambda x: (expr(x), 1),
                 lambda r, x: (r[0] + expr(x), r[1] + 1),
                 lambda r1, r2: (r1[0] + r2[0], r1[1] + r2[1]),
-                lambda r: float(r[0]) / r[1], 
+                lambda r: float(r[0]) / r[1],
             )
-                
+
         else:
             return (
                 lambda x: set([expr(x)]),
                 lambda r, x: r.add(expr(x)) or r,
                 lambda r1, r2: r1.union(r2),
-                lambda r: float(sum(r)) / len(r), 
+                lambda r: float(sum(r)) / len(r),
             )
 
     def __repr__(self):
@@ -718,7 +718,7 @@ class AdcountExpr(SetExpr):
     def get_subexpr(self):
         return [self.expr] if self.expr is not None else []
 
-########## Parsers ########## 
+########## Parsers ##########
 def number():
     return bind(
         pluses(
@@ -965,8 +965,8 @@ def having_clause():
 
 def table_expression():
     return seqs(from_clause(),
-                plus(where_clause(), result(None)), 
-                plus(group_by_clause(), result(None)), 
+                plus(where_clause(), result(None)),
+                plus(group_by_clause(), result(None)),
                 plus(having_clause(), result(None)))
 
 def select_statement():
@@ -1008,14 +1008,14 @@ def textfile_expr():
 def create_table_statement():
     return bind(seqs(
         Keyword.sat('CREATE'),
-        Keyword.sat('TABLE'), 
+        Keyword.sat('TABLE'),
         plus(seqs(Keyword.sat('IF'), Keyword.sat('NOT'), Keyword.sat('EXISTS')), result(None)),
         Identity.sat(),
     ), lambda (_, __, exists, table_name):
         bind(bracket(
             seq(Identity.sat(), plus(Type.sat(),result(Type()))),
             SpecialChar.sat(','),
-            SpecialChar.sat('('), 
+            SpecialChar.sat('('),
             SpecialChar.sat(')')), lambda columns:
             bind(textfile_expr(), lambda expr:
                  result(CreateTableSt(table_name, columns,
@@ -1080,7 +1080,7 @@ def statement_parser():
 def script_parser():
     return many(statement_parser())
 
-########## Runtimes ########## 
+########## Runtimes ##########
 tables = {}
 global_env = {'__builtins__': globals()['__builtins__']}
 
@@ -1166,7 +1166,7 @@ class SelectSt(SQLStatement):
 
     def __repr__(self):
         return 'SELECT %s FROM %s%s%s%s%s%s%s' % (
-            self.select_list, self.table, 
+            self.select_list, self.table,
             ' WHERE %s'  % self.where if self.where else '',
             ' GROUP BY %s' % self.group_by if self.group_by else '',
             ' HAVING %s' % self.having if self.having else '',
@@ -1174,7 +1174,7 @@ class SelectSt(SQLStatement):
             ' LIMIT %s' % self.limit if self.limit else '',
             ' INTO OUTFILE "%s"' % self.outfile if self.outfile else '',
         )
-    
+
     def gen_rdd(self, **kwargs):
         use_limit = kwargs.get('use_limist', False)
         table = self.table
@@ -1196,7 +1196,7 @@ class SelectSt(SQLStatement):
         rdd = table.gen_rdd(use_limit=use_limit)
         if self.where:
             rdd = rdd.filter(self.where(schema))
-        
+
         if scope or self.group_by is not None:
             column_len = len(table.get_columns())
             creators = [lambda x:x]
@@ -1252,7 +1252,7 @@ class SelectSt(SQLStatement):
         if self.order:
             reverse = (self.order[1] == 'DESC')
             rdd = rdd.sort(key = self.order[0](schema), reverse=reverse)
-            
+
         rdd = rdd.map(output_mapper)
         return rdd
 
@@ -1373,7 +1373,7 @@ class Console(object):
             readline.read_history_file(hist_file)
         except IOError:
             pass
-        
+
         atexit.register(readline.write_history_file, hist_file)
 
         init_file = os.path.join(base_dir, 'init')
@@ -1426,7 +1426,7 @@ class Console(object):
     def help(self, args):
         usage = '''Supported SQL:
 \tCREATE TABLE [IF NOT EXISTS] tbl_name (create_definition[, ...]) FROM "file_path" [$"python_expression"]
-\tSELECT expr FROM tbl_name[<path_sel, ...>] [AS alias] [[INNER|OUTER|LEFT|RIGHT] JOIN tbl_ref USING (t1_col, t2_col)] [WHERE condition] [GROUP BY cols]  [HAVING condition] [ORDER BY cols [ASC | DESC]] [LIMIT n] [INTO OUTFILE file]
+\tSELECT expr FROM tbl_name[<start, end>] [AS alias] [[INNER|OUTER|LEFT|RIGHT] JOIN tbl_ref USING (t1_col, t2_col)] [WHERE condition] [GROUP BY cols]  [HAVING condition] [ORDER BY cols [ASC | DESC]] [LIMIT n] [INTO OUTFILE file]
 \tDROP TABLE tbl_name, ...
 \tSHOW TABLES [LIKE "pattern"]
 \tSHOW CREATE TABLE tbl_name'
@@ -1450,9 +1450,9 @@ Use Python expression:
         st, remain = result[0]
         remain = list(remain)
         if remain:
-            raise Exception('Fail to parse statement: %s' 
+            raise Exception('Fail to parse statement: %s'
                             % ' '.join(str(t) for t in remain))
-        
+
         st.execute()
 
     def run_script(self, script):
@@ -1469,12 +1469,12 @@ Use Python expression:
         if remain:
             raise Exception('Fail to parse script: %s'
                             % ' '.join(str(t) for t in remain))
-        
+
         for s in st:
             s.execute()
 
     def run(self):
-        print "Welcome to DQuery 1.0, enjoy SQL and DPark! type 'help' for help."
+        print "Welcome to DQuery 2.0, enjoy SQL and DPark! type 'help' for help."
         while True:
             try:
                 if self.sql:
@@ -1484,7 +1484,7 @@ Use Python expression:
             except EOFError:
                 print 'quit'
                 break
-            
+
             try:
                 for c in self.CMDS:
                     s = self.sql.strip()
